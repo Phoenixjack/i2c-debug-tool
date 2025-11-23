@@ -1,8 +1,38 @@
 #include <Wire.h>
+#include <avr/pgmspace.h>
 
 const uint32_t SERIAL_BAUD = 115200;
 const uint8_t  I2C_SDA_PIN = SDA; // adjust if needed
 const uint8_t  I2C_SCL_PIN = SCL; // adjust if needed
+
+#define MAX_NAME_LEN 32
+
+struct I2C_DeviceInfo {
+  uint8_t address;           // 7-bit I2C address
+  char    name[MAX_NAME_LEN];
+  uint8_t chip_id_reg;       // 0xFF = no ID register check
+  uint8_t expected_chip_id;  // expected value after mask
+  uint8_t id_mask;           // bits to compare (0xFF = exact)
+} PROGMEM;
+
+const I2C_DeviceInfo i2c_devices[] PROGMEM = {
+  // Same address, same WHO_AM_I register, different IDs
+  { 0x68, "MPU-6050",              0x75, 0x68, 0xFF },
+  { 0x68, "MPU-9250 / ICM-20948",  0x75, 0x71, 0xFF },
+
+  // BME/BMP variants (same addr + reg + ID)
+  { 0x76, "BME280 / BMP280 (def)", 0xD0, 0x60, 0xFF },
+  { 0x77, "BME280 / BMP280 (alt)", 0xD0, 0x60, 0xFF },
+
+  // Devices with no chip-ID check: use chip_id_reg = 0xFF
+  { 0x23, "BH1750 Light Sensor",   0xFF, 0x00, 0x00 },
+  { 0x29, "TSL2561 / APDS-9960",   0xFF, 0x00, 0x00 },
+  { 0x40, "HTU21D / Si7021",       0xFF, 0x00, 0x00 },
+  { 0x3C, "OLED (SSD1306)",        0xFF, 0x00, 0x00 },
+  { 0x3D, "OLED (SSD1306)",        0xFF, 0x00, 0x00 },
+};
+
+const size_t NUM_I2C_DEVICES = sizeof(i2c_devices) / sizeof(i2c_devices[0]);
 
 // --------- Utility: hex parsing / printing ----------
 
@@ -102,6 +132,54 @@ bool i2cReadRange(uint8_t addr, uint8_t startReg, uint8_t endReg) {
   return true;
 }
 
+// --------- Device identification ----------
+
+void appendName(String &dest, const String &name) {
+  if (dest.length() > 0) dest += F(", ");
+  dest += name;
+}
+
+void describeI2CAddress(uint8_t addr) {
+  String confirmedNames;
+  String possibleNames;
+  bool   hasDatabaseMatch = false;
+
+  for (size_t i = 0; i < NUM_I2C_DEVICES; i++) {
+    I2C_DeviceInfo info;
+    memcpy_P(&info, &i2c_devices[i], sizeof(I2C_DeviceInfo));
+    if (info.address != addr) continue;
+
+    hasDatabaseMatch = true;
+    String name(info.name);
+
+    if (info.chip_id_reg == 0xFF) {
+      appendName(possibleNames, name);
+      continue;
+    }
+
+    uint8_t chipId = 0;
+    bool ok = i2cReadRegister(addr, info.chip_id_reg, chipId);
+    if (ok && ((chipId & info.id_mask) == (info.expected_chip_id & info.id_mask))) {
+      appendName(confirmedNames, name);
+    } else {
+      appendName(possibleNames, name);
+    }
+  }
+
+  Serial.print(F("  Found: 0x"));
+  printHexByte(addr);
+
+  if (hasDatabaseMatch && confirmedNames.length() > 0) {
+    Serial.print(F(". CONFIRMED: "));
+    Serial.println(confirmedNames);
+  } else if (hasDatabaseMatch) {
+    Serial.print(F(". ChipID not matched. Possible "));
+    Serial.println(possibleNames);
+  } else {
+    Serial.println(F(". No match in database"));
+  }
+}
+
 // --------- Commands ----------
 
 void cmdHelp() {
@@ -121,9 +199,7 @@ void cmdScan() {
     Wire.beginTransmission(addr);
     uint8_t err = Wire.endTransmission();
     if (err == 0) {
-      Serial.print(F("  Found: 0x"));
-      printHexByte(addr);
-      Serial.println();
+      describeI2CAddress(addr);
     }
   }
   Serial.println(F("Scan complete."));
