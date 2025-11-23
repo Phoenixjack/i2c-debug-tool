@@ -1,8 +1,71 @@
 #include <Wire.h>
+#include <EEPROM.h>
+#include <avr/pgmspace.h>
 
 const uint32_t SERIAL_BAUD = 115200;
 const uint8_t  I2C_SDA_PIN = SDA; // adjust if needed
 const uint8_t  I2C_SCL_PIN = SCL; // adjust if needed
+
+#define MAX_NAME_LEN 32
+#define EEPROM_MAX_DEVICES 8
+#define EEPROM_BASE_ADDR 0
+
+struct I2C_DeviceInfo {
+  uint8_t address;           // 7-bit I2C address
+  char    name[MAX_NAME_LEN];
+  uint8_t chip_id_reg;       // 0xFF = no ID register check
+  uint8_t expected_chip_id;  // expected value after mask
+  uint8_t id_mask;           // bits to compare (0xFF = exact)
+} PROGMEM;
+
+// Expanded with common entries from https://i2cdevices.org/addresses
+const I2C_DeviceInfo i2c_devices[] PROGMEM = {
+  // Same address, same WHO_AM_I register, different IDs
+  { 0x68, "MPU-6050",               0x75, 0x68, 0xFF },
+  { 0x68, "MPU-9250 / ICM-20948",   0x75, 0x71, 0xFF },
+
+  // Environmental sensors
+  { 0x76, "BME280 / BMP280 (def)",  0xD0, 0x60, 0xFF },
+  { 0x77, "BME280 / BMP280 (alt)",  0xD0, 0x60, 0xFF },
+  { 0x76, "BME680 (def)",           0xD0, 0x61, 0xFF },
+  { 0x77, "BME680 (alt)",           0xD0, 0x61, 0xFF },
+  { 0x40, "HTU21D / Si7021",        0xFF, 0x00, 0x00 },
+
+  // Light / proximity
+  { 0x23, "BH1750 Light Sensor",    0xFF, 0x00, 0x00 },
+  { 0x29, "TSL2561 (GND addr)",     0xFF, 0x00, 0x00 },
+  { 0x39, "TSL2561 / APDS-9960",    0xFF, 0x00, 0x00 },
+  { 0x49, "TSL2561 (VCC addr)",     0xFF, 0x00, 0x00 },
+
+  // Accelerometers / IMUs
+  { 0x18, "LIS3DH accelerometer",   0x0F, 0x33, 0xFF },
+  { 0x19, "LIS3DH accelerometer",   0x0F, 0x33, 0xFF },
+  { 0x1E, "LIS3MDL magnetometer",   0x0F, 0x3D, 0xFF },
+  { 0x6A, "LSM6DS3 / LSM6DS33",     0x0F, 0x69, 0xFF },
+  { 0x6B, "LSM6DS3 / LSM6DS33",     0x0F, 0x69, 0xFF },
+  { 0x53, "ADXL345 accelerometer",  0x00, 0xE5, 0xFF },
+
+  // GPIO expanders
+  { 0x20, "MCP23008 / MCP23017",    0xFF, 0x00, 0x00 },
+  { 0x27, "PCF8574A backpack",      0xFF, 0x00, 0x00 },
+
+  // ADC / temperature sensors
+  { 0x48, "ADS111x / TMP102 (def)", 0xFF, 0x00, 0x00 },
+  { 0x49, "ADS111x / TMP102",       0xFF, 0x00, 0x00 },
+  { 0x4A, "ADS111x / TMP102",       0xFF, 0x00, 0x00 },
+  { 0x4B, "ADS111x / TMP102",       0xFF, 0x00, 0x00 },
+
+  // Displays / RTCs
+  { 0x3C, "OLED (SSD1306)",         0xFF, 0x00, 0x00 },
+  { 0x3D, "OLED (SSD1306)",         0xFF, 0x00, 0x00 },
+  { 0x68, "DS1307 / DS3231 RTC",    0xFF, 0x00, 0x00 },
+
+  // EEPROM / memory
+  { 0x50, "24Cxx EEPROM",           0xFF, 0x00, 0x00 },
+};
+
+const size_t NUM_I2C_DEVICES = sizeof(i2c_devices) / sizeof(i2c_devices[0]);
+const size_t EEPROM_ENTRY_SIZE = sizeof(I2C_DeviceInfo);
 
 // --------- Utility: hex parsing / printing ----------
 
@@ -31,6 +94,46 @@ void printHex16(uint16_t v) {
   else if (v < 0x100) Serial.print("00");
   else if (v < 0x1000) Serial.print('0');
   Serial.print(v, HEX);
+}
+
+String readLineBlocking() {
+  String line;
+  while (true) {
+    while (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line.trim();
+        return line;
+      }
+      if (isPrintable(c)) {
+        line += c;
+        Serial.print(c);
+      }
+    }
+    delay(1);
+  }
+}
+
+bool parseHexPrompt(const __FlashStringHelper *prompt, uint8_t &valueOut, uint8_t defaultVal, bool allowBlank) {
+  while (true) {
+    Serial.print(prompt);
+    String resp = readLineBlocking();
+    Serial.println();
+    if (resp.length() == 0 && allowBlank) {
+      valueOut = defaultVal;
+      return true;
+    }
+
+    bool ok = false;
+    uint16_t v = parseHex(resp, ok);
+    if (ok && v <= 0xFF) {
+      valueOut = (uint8_t)v;
+      return true;
+    }
+
+    Serial.println(F("  Invalid hex value. Try again."));
+  }
 }
 
 // --------- I2C helpers ----------
@@ -102,6 +205,146 @@ bool i2cReadRange(uint8_t addr, uint8_t startReg, uint8_t endReg) {
   return true;
 }
 
+// --------- EEPROM-backed device storage ----------
+
+bool eepromSlotUsed(const I2C_DeviceInfo &info) {
+  return info.address <= 0x7F && info.name[0] != 0xFF && info.name[0] != '\0';
+}
+
+void loadEepromDevice(size_t slot, I2C_DeviceInfo &info) {
+  int base = EEPROM_BASE_ADDR + slot * EEPROM_ENTRY_SIZE;
+  EEPROM.get(base, info);
+}
+
+void saveEepromDevice(size_t slot, const I2C_DeviceInfo &info) {
+  int base = EEPROM_BASE_ADDR + slot * EEPROM_ENTRY_SIZE;
+  EEPROM.put(base, info);
+}
+
+int findFreeEepromSlot() {
+  for (size_t i = 0; i < EEPROM_MAX_DEVICES; i++) {
+    I2C_DeviceInfo info;
+    loadEepromDevice(i, info);
+    if (!eepromSlotUsed(info)) return (int)i;
+  }
+  return -1;
+}
+
+// --------- Device identification ----------
+
+void appendName(String &dest, const String &name) {
+  if (dest.length() > 0) dest += F(", ");
+  dest += name;
+}
+
+void considerDeviceMatch(const I2C_DeviceInfo &info, uint8_t addr, String &confirmedNames, String &possibleNames, bool &hasDatabaseMatch) {
+  if (info.address != addr) return;
+
+  hasDatabaseMatch = true;
+  String name(info.name);
+
+  if (info.chip_id_reg == 0xFF) {
+    appendName(possibleNames, name);
+    return;
+  }
+
+  uint8_t chipId = 0;
+  bool ok = i2cReadRegister(addr, info.chip_id_reg, chipId);
+  if (ok && ((chipId & info.id_mask) == (info.expected_chip_id & info.id_mask))) {
+    appendName(confirmedNames, name);
+  } else {
+    appendName(possibleNames, name);
+  }
+}
+
+bool promptAddDeviceToEeprom(uint8_t addr) {
+  Serial.print(F("  No match for 0x"));
+  printHexByte(addr);
+  Serial.print(F(". Add to EEPROM? [y/N]: "));
+  String resp = readLineBlocking();
+  resp.toLowerCase();
+  if (!(resp == "y" || resp == "yes")) {
+    Serial.println();
+    return false;
+  }
+
+  int slot = findFreeEepromSlot();
+  if (slot < 0) {
+    Serial.println(F("\n  EEPROM is full. Delete an entry to add more."));
+    return false;
+  }
+
+  I2C_DeviceInfo info;
+  memset(&info, 0xFF, sizeof(info));
+  info.address = addr;
+  info.id_mask = 0xFF;
+
+  Serial.println();
+  Serial.print(F("  Enter device name (max 31 chars): "));
+  String name = readLineBlocking();
+  if (name.length() == 0) {
+    name = F("Custom 0x");
+    char buf[3];
+    snprintf(buf, sizeof(buf), "%02X", addr);
+    name += buf;
+  }
+  name.remove(MAX_NAME_LEN - 1); // ensure space for null terminator
+  name.toCharArray(info.name, MAX_NAME_LEN);
+
+  Serial.println();
+  Serial.println(F("  CHIPID setup:"));
+  Serial.println(F("    - Enter FF if no chip-ID check is available"));
+  uint8_t chipReg = 0xFF;
+  parseHexPrompt(F("    Chip ID register (hex): "), chipReg, 0xFF, false);
+  info.chip_id_reg = chipReg;
+
+  uint8_t chipVal = 0x00;
+  parseHexPrompt(F("    Expected chip ID value (hex): "), chipVal, 0x00, true);
+  info.expected_chip_id = chipVal;
+
+  uint8_t maskVal = 0xFF;
+  parseHexPrompt(F("    ID mask (hex, blank for FF): "), maskVal, 0xFF, true);
+  info.id_mask = maskVal;
+
+  saveEepromDevice((size_t)slot, info);
+  Serial.print(F("\n  Saved to EEPROM slot "));
+  Serial.println(slot);
+  return true;
+}
+
+void describeI2CAddress(uint8_t addr) {
+  String confirmedNames;
+  String possibleNames;
+  bool   hasDatabaseMatch = false;
+
+  for (size_t i = 0; i < NUM_I2C_DEVICES; i++) {
+    I2C_DeviceInfo info;
+    memcpy_P(&info, &i2c_devices[i], sizeof(I2C_DeviceInfo));
+    considerDeviceMatch(info, addr, confirmedNames, possibleNames, hasDatabaseMatch);
+  }
+
+  for (size_t i = 0; i < EEPROM_MAX_DEVICES; i++) {
+    I2C_DeviceInfo info;
+    loadEepromDevice(i, info);
+    if (!eepromSlotUsed(info)) continue;
+    considerDeviceMatch(info, addr, confirmedNames, possibleNames, hasDatabaseMatch);
+  }
+
+  Serial.print(F("  Found: 0x"));
+  printHexByte(addr);
+
+  if (hasDatabaseMatch && confirmedNames.length() > 0) {
+    Serial.print(F(". CONFIRMED: "));
+    Serial.println(confirmedNames);
+  } else if (hasDatabaseMatch) {
+    Serial.print(F(". ChipID not matched. Possible "));
+    Serial.println(possibleNames);
+  } else {
+    Serial.println(F(". No match in database or EEPROM"));
+    promptAddDeviceToEeprom(addr);
+  }
+}
+
 // --------- Commands ----------
 
 void cmdHelp() {
@@ -121,9 +364,7 @@ void cmdScan() {
     Wire.beginTransmission(addr);
     uint8_t err = Wire.endTransmission();
     if (err == 0) {
-      Serial.print(F("  Found: 0x"));
-      printHexByte(addr);
-      Serial.println();
+      describeI2CAddress(addr);
     }
   }
   Serial.println(F("Scan complete."));
